@@ -1,0 +1,215 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLAUDE_MODEL: claude-sonnet-4-6
+      MAX_DIFF_BYTES: 200000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect PR diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr diff "${{ github.event.pull_request.number }}" > /tmp/pr.diff
+          DIFF_SIZE=$(wc -c < /tmp/pr.diff)
+          echo "Diff size: ${DIFF_SIZE} bytes"
+          if [ "${DIFF_SIZE}" -gt "${MAX_DIFF_BYTES}" ]; then
+            head -c "${MAX_DIFF_BYTES}" /tmp/pr.diff > /tmp/pr.diff.trunc
+            printf '\n[... diff truncated to %s bytes for review ...]\n' "${MAX_DIFF_BYTES}" >> /tmp/pr.diff.trunc
+            mv /tmp/pr.diff.trunc /tmp/pr.diff
+          fi
+
+      - name: Resolve system prompt
+        run: |
+          set -euo pipefail
+          if [ -f ".github/claude-review-prompt.md" ]; then
+            cp .github/claude-review-prompt.md /tmp/system.md
+            echo "Using project-specific prompt from .github/claude-review-prompt.md"
+          else
+            cat > /tmp/system.md <<'PROMPT'
+          You are a senior software engineer performing a pull request review.
+
+          Focus on:
+          - Correctness and obvious bugs
+          - Security issues (injection, XSS, auth bypass, secret leakage, OWASP top 10)
+          - Performance issues that matter at scale
+          - Maintainability red flags (dead code, leaky abstractions, missing error handling at boundaries)
+
+          Skip:
+          - Style nitpicks already handled by linters
+          - Praise. Be terse and direct.
+          - Suggestions outside the PR scope
+
+          Output format: GitHub-flavored markdown.
+
+          ## Summary
+          Two or three lines. What this PR does and overall verdict.
+
+          ## Findings
+          Bulleted, each prefixed by severity in brackets: [BLOCKER], [MAJOR], [MINOR], [NIT].
+          Cite file paths and line ranges when possible.
+          Omit this section entirely if there are no findings.
+
+          ## Suggested follow-ups
+          Optional. Only if non-trivial.
+
+          If the PR is clean, say so in a single line.
+          PROMPT
+            echo "Using default prompt"
+          fi
+
+      - name: Call Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'PR title: %s\n\nPR description:\n%s\n\n--- BEGIN DIFF ---\n' \
+              "${PR_TITLE}" "${PR_BODY:-(no description)}"
+            cat /tmp/pr.diff
+            printf '\n--- END DIFF ---\n'
+          } > /tmp/user.txt
+
+          jq -n \
+            --arg model "${CLAUDE_MODEL}" \
+            --rawfile system /tmp/system.md \
+            --rawfile user /tmp/user.txt \
+            '{
+              model: $model,
+              max_tokens: 4096,
+              system: $system,
+              messages: [{role: "user", content: $user}]
+            }' > /tmp/payload.json
+
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data-binary @/tmp/payload.json)
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "Anthropic API returned ${HTTP_CODE}"
+            cat /tmp/response.json
+            exit 1
+          fi
+
+          jq -r '.content[0].text' /tmp/response.json > /tmp/review.md
+          echo "Review length: $(wc -c < /tmp/review.md) bytes"
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- claude-pr-review -->'
+          {
+            printf '%s\n' "${MARKER}"
+            printf '### Claude PR Review (%s)\n\n' "${CLAUDE_MODEL}"
+            cat /tmp/review.md
+            printf '\n\n---\n<sub>Automated review. Use it as input, not as a gate. Updated on every push.</sub>\n'
+          } > /tmp/comment.md
+
+          EXISTING_ID=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            | jq -r --arg marker "${MARKER}" '[.[] | select(.body | startswith($marker))][0].id // empty')
+
+          if [ -n "${EXISTING_ID}" ]; then
+            echo "Updating existing comment ${EXISTING_ID}"
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" \
+              --field "body=@/tmp/comment.md" >/dev/null
+          else
+            echo "Posting new comment"
+            gh pr comment "${PR_NUMBER}" --body-file /tmp/comment.md
+          fi
+
+      - name: Log trace to Langfuse
+        continue-on-error: true
+        env:
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LANGFUSE_PUBLIC_KEY}" ] || [ -z "${LANGFUSE_SECRET_KEY}" ] || [ -z "${LANGFUSE_HOST}" ]; then
+            echo "Langfuse not configured (missing one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST). Skipping trace."
+            exit 0
+          fi
+          TRACE_ID=$(cat /proc/sys/kernel/random/uuid)
+          GEN_ID=$(cat /proc/sys/kernel/random/uuid)
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+          INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' /tmp/response.json)
+          OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' /tmp/response.json)
+
+          jq -n \
+            --arg trace_id "${TRACE_ID}" \
+            --arg gen_id "${GEN_ID}" \
+            --arg now "${NOW}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg pr "${{ github.event.pull_request.number }}" \
+            --arg model "${CLAUDE_MODEL}" \
+            --argjson input_tokens "${INPUT_TOKENS}" \
+            --argjson output_tokens "${OUTPUT_TOKENS}" \
+            --rawfile review /tmp/review.md \
+            --rawfile user_input /tmp/user.txt \
+            --rawfile system_prompt /tmp/system.md \
+            '{
+              batch: [
+                {
+                  id: $trace_id,
+                  type: "trace-create",
+                  timestamp: $now,
+                  body: {
+                    id: $trace_id,
+                    name: "claude-pr-review",
+                    metadata: {repo: $repo, pr_number: $pr},
+                    tags: ["pr-review", "github-action"]
+                  }
+                },
+                {
+                  id: $gen_id,
+                  type: "generation-create",
+                  timestamp: $now,
+                  body: {
+                    id: $gen_id,
+                    traceId: $trace_id,
+                    name: "claude-review-call",
+                    model: $model,
+                    startTime: $now,
+                    endTime: $now,
+                    usage: {input: $input_tokens, output: $output_tokens, unit: "TOKENS"},
+                    input: {system: $system_prompt, user: $user_input},
+                    output: $review
+                  }
+                }
+              ]
+            }' > /tmp/langfuse.json
+
+          curl -s -o /dev/null -w "Langfuse HTTP %{http_code}\n" \
+            -X POST "${LANGFUSE_HOST%/}/api/public/ingestion" \
+            -u "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/langfuse.json
