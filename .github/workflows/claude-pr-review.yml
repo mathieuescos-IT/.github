@@ -85,20 +85,22 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
+          {
+            printf 'PR title: %s\n\nPR description:\n%s\n\n--- BEGIN DIFF ---\n' \
+              "${PR_TITLE}" "${PR_BODY:-(no description)}"
+            cat /tmp/pr.diff
+            printf '\n--- END DIFF ---\n'
+          } > /tmp/user.txt
+
           jq -n \
             --arg model "${CLAUDE_MODEL}" \
             --rawfile system /tmp/system.md \
-            --arg title "${PR_TITLE}" \
-            --arg body "${PR_BODY:-(no description)}" \
-            --rawfile diff /tmp/pr.diff \
+            --rawfile user /tmp/user.txt \
             '{
               model: $model,
               max_tokens: 4096,
               system: $system,
-              messages: [{
-                role: "user",
-                content: "PR title: " + $title + "\n\nPR description:\n" + $body + "\n\n--- BEGIN DIFF ---\n" + $diff + "\n--- END DIFF ---\n"
-              }]
+              messages: [{role: "user", content: $user}]
             }' > /tmp/payload.json
 
           HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
