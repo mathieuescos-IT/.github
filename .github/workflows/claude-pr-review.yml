@@ -118,16 +118,31 @@ jobs:
       - name: Post review comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          MARKER='<!-- claude-pr-review -->'
           {
+            printf '%s\n' "${MARKER}"
             printf '### Claude PR Review (%s)\n\n' "${CLAUDE_MODEL}"
             cat /tmp/review.md
-            printf '\n\n---\n<sub>Automated review. Use it as input, not as a gate.</sub>\n'
+            printf '\n\n---\n<sub>Automated review. Use it as input, not as a gate. Updated on every push.</sub>\n'
           } > /tmp/comment.md
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md
+
+          EXISTING_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | startswith(\"${MARKER}\"))][0].id // empty")
+
+          if [ -n "${EXISTING_ID}" ]; then
+            echo "Updating existing comment ${EXISTING_ID}"
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" \
+              --field "body=@/tmp/comment.md" >/dev/null
+          else
+            echo "Posting new comment"
+            gh pr comment "${PR_NUMBER}" --body-file /tmp/comment.md
+          fi
 
       - name: Log trace to Langfuse
+        continue-on-error: true
         env:
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
