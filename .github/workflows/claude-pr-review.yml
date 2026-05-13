@@ -128,13 +128,16 @@ jobs:
           gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md
 
       - name: Log trace to Langfuse
-        if: ${{ secrets.LANGFUSE_PUBLIC_KEY != '' && secrets.LANGFUSE_HOST != '' }}
         env:
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
         run: |
           set -euo pipefail
+          if [ -z "${LANGFUSE_PUBLIC_KEY}" ] || [ -z "${LANGFUSE_HOST}" ]; then
+            echo "Langfuse not configured (missing LANGFUSE_PUBLIC_KEY or LANGFUSE_HOST). Skipping trace."
+            exit 0
+          fi
           TRACE_ID=$(uuidgen)
           GEN_ID=$(uuidgen)
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
