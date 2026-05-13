@@ -23,6 +23,11 @@ Tone:
 - Cite file paths and line ranges where relevant.
 - If you are uncertain, say so explicitly with `[uncertain]`.
 
+Output discipline:
+- Do NOT include findings that you contradict or retract within the same bullet. If you start a finding then realize it does not apply, OMIT it entirely. The reader should never see "...actually disregard this point" or "...this is actually fine".
+- One finding per bullet. Do not pile multiple unrelated concerns into the same item.
+- If the diff is small or trivial, do not pad with hypothetical risks.
+
 Output format (GitHub-flavored markdown):
 
 ## Summary

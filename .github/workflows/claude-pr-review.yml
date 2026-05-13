@@ -16,6 +16,7 @@ jobs:
   review:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       CLAUDE_MODEL: claude-sonnet-4-6
       MAX_DIFF_BYTES: 200000
@@ -133,7 +134,7 @@ jobs:
             printf '\n\n---\n<sub>Automated review. Use it as input, not as a gate. Updated on every push.</sub>\n'
           } > /tmp/comment.md
 
-          EXISTING_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          EXISTING_ID=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
             | jq -r --arg marker "${MARKER}" '[.[] | select(.body | startswith($marker))][0].id // empty')
 
           if [ -n "${EXISTING_ID}" ]; then
@@ -157,11 +158,11 @@ jobs:
             echo "Langfuse not configured (missing one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST). Skipping trace."
             exit 0
           fi
-          TRACE_ID=$(uuidgen)
-          GEN_ID=$(uuidgen)
+          TRACE_ID=$(cat /proc/sys/kernel/random/uuid)
+          GEN_ID=$(cat /proc/sys/kernel/random/uuid)
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-          INPUT_TOKENS=$(jq -r '.usage.input_tokens' /tmp/response.json)
-          OUTPUT_TOKENS=$(jq -r '.usage.output_tokens' /tmp/response.json)
+          INPUT_TOKENS=$(jq -r '.usage.input_tokens // 0' /tmp/response.json)
+          OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // 0' /tmp/response.json)
 
           jq -n \
             --arg trace_id "${TRACE_ID}" \
@@ -173,6 +174,8 @@ jobs:
             --argjson input_tokens "${INPUT_TOKENS}" \
             --argjson output_tokens "${OUTPUT_TOKENS}" \
             --rawfile review /tmp/review.md \
+            --rawfile user_input /tmp/user.txt \
+            --rawfile system_prompt /tmp/system.md \
             '{
               batch: [
                 {
@@ -198,6 +201,7 @@ jobs:
                     startTime: $now,
                     endTime: $now,
                     usage: {input: $input_tokens, output: $output_tokens, unit: "TOKENS"},
+                    input: {system: $system_prompt, user: $user_input},
                     output: $review
                   }
                 }
