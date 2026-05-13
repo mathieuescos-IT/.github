@@ -208,7 +208,7 @@ jobs:
               ]
             }' > /tmp/langfuse.json
 
-          curl -s -o /dev/null -w "Langfuse HTTP %{http_code}\n" \
+          curl -sSL -o /dev/null -w "Langfuse HTTP %{http_code}\n" \
             -X POST "${LANGFUSE_HOST%/}/api/public/ingestion" \
             -u "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" \
             -H "Content-Type: application/json" \
